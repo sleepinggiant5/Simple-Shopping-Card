@@ -5,11 +5,16 @@
  *   - add / check / delete items
  *   - +/- quantity stepper on every item
  *   - choose how long completed items stay visible (today, 24h, 7d, ...)
+ *   - NEW: tag each item with a store (dropdown on every item, optional grouping)
+ *
+ * Stores are saved in the item name as a suffix, e.g. "2 × Milk [Costco]",
+ * so it works with any todo integration and survives card/browser changes.
+ * Only tags that match a configured store are treated as stores.
  *
  * No build step needed. Plain custom element, themed with HA CSS variables.
  */
 
-const CARD_VERSION = "1.0.0";
+const CARD_VERSION = "1.1.0";
 
 const PERIODS = {
   today: {
@@ -58,10 +63,17 @@ class SimpleShoppingCard extends HTMLElement {
       quantity_storage: "summary", // "summary" -> "2 × Milk", "description" -> description = "2"
       show_period_selector: true,
       show_clear_completed: true,
+      stores: [], // e.g. ["Costco", "Stop & Shop"]; empty = store feature off
+      group_by_store: false, // group open items under store headings
       ...config,
     };
+    this._config.stores = (Array.isArray(this._config.stores) ? this._config.stores : [])
+      .map((s) => String(s).trim())
+      .filter(Boolean);
     const saved = this._loadPref("period");
     this._period = PERIODS[saved] ? saved : PERIODS[this._config.completed_period] ? this._config.completed_period : "today";
+    const savedStore = this._loadPref("addstore");
+    this._addStore = this._config.stores.includes(savedStore) ? savedStore : "";
     this._build();
     if (this._hass) this._fetch();
   }
@@ -106,22 +118,41 @@ class SimpleShoppingCard extends HTMLElement {
     return m ? { qty: Math.max(1, parseInt(m[1], 10)), name: m[2].trim() } : { qty: 1, name: String(text).trim() };
   }
 
+  // "Milk [Costco]" -> { text: "Milk", store: "Costco" } (only for configured stores)
+  _splitStore(text) {
+    const stores = this._config.stores;
+    const m = String(text).match(/^(.*?)\s*\[([^\]]+)\]\s*$/);
+    if (m && stores.length) {
+      const hit = stores.find((s) => s.toLowerCase() === m[2].trim().toLowerCase());
+      if (hit) return { text: m[1].trim(), store: hit };
+    }
+    return { text: String(text).trim(), store: null };
+  }
+
   _parse(raw) {
-    let name = raw.summary || "";
+    const { text, store } = this._splitStore(raw.summary || "");
+    let name = text;
     let qty = 1;
     if (this._config.quantity_storage === "description") {
       const m = String(raw.description || "").match(/^\s*(\d+)\s*$/);
       if (m) qty = Math.max(1, parseInt(m[1], 10));
     } else {
-      ({ name, qty } = this._parseSummary(name));
+      ({ name, qty } = this._parseSummary(text));
     }
-    return { uid: raw.uid, name, qty, done: raw.status === "completed" };
+    return { uid: raw.uid, name, qty, store, done: raw.status === "completed" };
   }
 
-  _qtyPayload(name, qty) {
+  // Build the stored summary text from its parts
+  _compose(name, qty, store) {
+    let s = name;
+    if (this._config.quantity_storage !== "description" && qty > 1) s = `${qty} × ${name}`;
+    return store ? `${s} [${store}]` : s;
+  }
+
+  _qtyPayload(it, qty) {
     return this._config.quantity_storage === "description"
       ? { description: String(qty) }
-      : { rename: qty > 1 ? `${qty} × ${name}` : name };
+      : { rename: this._compose(it.name, qty, it.store) };
   }
 
   /* ---------- completion timestamps ----------
@@ -195,13 +226,15 @@ class SimpleShoppingCard extends HTMLElement {
 
   /* ---------- actions ---------- */
 
-  async _add(text) {
+  async _add(text, store) {
     const { name, qty } = this._parseSummary(text);
     if (!name) return;
+    const tag = store || null;
     if (this._config.quantity_storage === "description") {
-      await this._call("add_item", qty > 1 ? { item: name, description: String(qty) } : { item: name });
+      const item = this._compose(name, 1, tag);
+      await this._call("add_item", qty > 1 ? { item, description: String(qty) } : { item });
     } else {
-      await this._call("add_item", { item: qty > 1 ? `${qty} × ${name}` : name });
+      await this._call("add_item", { item: this._compose(name, qty, tag) });
     }
     this._fetch();
   }
@@ -228,9 +261,21 @@ class SimpleShoppingCard extends HTMLElement {
     clearTimeout(this._timers[uid]);
     this._timers[uid] = setTimeout(async () => {
       delete this._timers[uid];
-      await this._call("update_item", { item: uid, ...this._qtyPayload(it.name, qty) });
+      // use the latest copy of the item so a store change made meanwhile isn't lost
+      const cur = this._items.find((i) => i.uid === uid) || it;
+      await this._call("update_item", { item: uid, ...this._qtyPayload(cur, qty) });
       delete this._pending[uid];
     }, 600);
+  }
+
+  _changeStore(uid, store) {
+    const it = this._items.find((i) => i.uid === uid);
+    if (!it) return;
+    const next = store || null;
+    if (next === it.store) return;
+    it.store = next;
+    this._render();
+    this._call("update_item", { item: uid, rename: this._compose(it.name, it.qty, next) });
   }
 
   async _remove(uid) {
@@ -248,7 +293,15 @@ class SimpleShoppingCard extends HTMLElement {
 
   /* ---------- DOM ---------- */
 
+  _storeOptions(selected) {
+    return [
+      `<option value="">No store</option>`,
+      ...this._config.stores.map((s) => `<option value="${esc(s)}" ${s === selected ? "selected" : ""}>${esc(s)}</option>`),
+    ].join("");
+  }
+
   _build() {
+    const hasStores = this._config.stores.length > 0;
     const periodOptions = Object.entries(PERIODS)
       .map(([k, v]) => `<option value="${k}" ${k === this._period ? "selected" : ""}>${v.label}</option>`)
       .join("");
@@ -275,6 +328,13 @@ class SimpleShoppingCard extends HTMLElement {
           border: 1px solid var(--divider-color);
           border-radius: 10px;
         }
+        .add select {
+          flex: none; max-width: 120px;
+          font: inherit; color: var(--primary-text-color);
+          background: var(--secondary-background-color);
+          border: 1px solid var(--divider-color);
+          border-radius: 10px; padding: 0 8px;
+        }
         .add input:focus-visible, button:focus-visible, select:focus-visible {
           outline: 2px solid var(--primary-color); outline-offset: 1px;
         }
@@ -300,6 +360,20 @@ class SimpleShoppingCard extends HTMLElement {
         }
         .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
         .row.done .name { text-decoration: line-through; color: var(--secondary-text-color); }
+        .store {
+          flex: none; max-width: 104px;
+          font: inherit; font-size: 13px; color: var(--secondary-text-color);
+          background: var(--secondary-background-color);
+          border: 1px solid var(--divider-color);
+          border-radius: 8px; padding: 4px 6px;
+        }
+        .store.set { color: var(--primary-text-color); }
+        .group {
+          padding: 10px 16px 2px; font-size: 13px; font-weight: 500;
+          letter-spacing: .03em; text-transform: uppercase;
+          color: var(--primary-color);
+        }
+        .group:not(:first-child) { margin-top: 4px; }
         .stepper {
           display: inline-flex; align-items: center;
           background: var(--secondary-background-color);
@@ -309,6 +383,10 @@ class SimpleShoppingCard extends HTMLElement {
         .stepper button:disabled { opacity: .3; cursor: default; }
         .stepper .n { min-width: 22px; text-align: center; font-variant-numeric: tabular-nums; font-weight: 500; }
         .badge { color: var(--secondary-text-color); font-variant-numeric: tabular-nums; flex: none; }
+        .tag {
+          flex: none; font-size: 12px; padding: 2px 8px; border-radius: 999px;
+          background: var(--secondary-background-color); color: var(--secondary-text-color);
+        }
         .del { width: 36px; height: 36px; color: var(--secondary-text-color); flex: none; }
         .empty { padding: 12px 16px; color: var(--secondary-text-color); }
         .completed-head {
@@ -333,6 +411,7 @@ class SimpleShoppingCard extends HTMLElement {
         <div id="error"></div>
         <div class="add">
           <input id="new" type="text" placeholder="Add item (e.g. 2x milk)" autocomplete="off" enterkeyhint="done" />
+          ${hasStores ? `<select id="addstore" aria-label="Store for new item">${this._storeOptions(this._addStore)}</select>` : ""}
           <button id="add" type="button">Add</button>
         </div>
         <div id="active"></div>
@@ -355,15 +434,22 @@ class SimpleShoppingCard extends HTMLElement {
 
     const root = this.shadowRoot;
     const input = root.getElementById("new");
+    const addStore = root.getElementById("addstore");
     const submit = () => {
       const v = input.value;
       input.value = "";
-      this._add(v);
+      this._add(v, addStore ? addStore.value : "");
     };
     root.getElementById("add").addEventListener("click", submit);
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") submit();
     });
+    if (addStore) {
+      addStore.addEventListener("change", () => {
+        this._addStore = addStore.value;
+        this._savePref("addstore", this._addStore);
+      });
+    }
 
     const period = root.getElementById("period");
     if (period) {
@@ -389,10 +475,32 @@ class SimpleShoppingCard extends HTMLElement {
     });
     root.addEventListener("change", (e) => {
       const cb = e.target.closest('input[data-action="toggle"]');
-      if (cb) this._toggle(cb.closest("[data-uid]").dataset.uid);
+      if (cb) return this._toggle(cb.closest("[data-uid]").dataset.uid);
+      const sel = e.target.closest('select[data-action="store"]');
+      if (sel) this._changeStore(sel.closest("[data-uid]").dataset.uid, sel.value);
     });
 
     this._render();
+  }
+
+  _activeRow(i) {
+    const storeSel = this._config.stores.length
+      ? `<select class="store ${i.store ? "set" : ""}" data-action="store" aria-label="Store for ${esc(i.name)}">${this._storeOptions(i.store)}</select>`
+      : "";
+    return `
+        <div class="row" data-uid="${esc(i.uid)}">
+          <input type="checkbox" data-action="toggle" aria-label="Mark ${esc(i.name)} as done" />
+          <span class="name">${esc(i.name)}</span>
+          ${storeSel}
+          <div class="stepper">
+            <button type="button" data-action="dec" aria-label="Decrease quantity" ${i.qty <= 1 ? "disabled" : ""}>−</button>
+            <span class="n" aria-live="polite">${i.qty}</span>
+            <button type="button" data-action="inc" aria-label="Increase quantity">+</button>
+          </div>
+          <button type="button" class="del" data-action="del" aria-label="Delete ${esc(i.name)}">
+            <ha-icon icon="mdi:close"></ha-icon>
+          </button>
+        </div>`;
   }
 
   _render() {
@@ -407,25 +515,21 @@ class SimpleShoppingCard extends HTMLElement {
       .filter((i) => i.done && (this._stamps[i.uid] ?? 0) >= since)
       .sort((a, b) => (this._stamps[b.uid] ?? 0) - (this._stamps[a.uid] ?? 0));
 
-    root.getElementById("active").innerHTML = active.length
-      ? active
-          .map(
-            (i) => `
-        <div class="row" data-uid="${esc(i.uid)}">
-          <input type="checkbox" data-action="toggle" aria-label="Mark ${esc(i.name)} as done" />
-          <span class="name">${esc(i.name)}</span>
-          <div class="stepper">
-            <button type="button" data-action="dec" aria-label="Decrease quantity" ${i.qty <= 1 ? "disabled" : ""}>−</button>
-            <span class="n" aria-live="polite">${i.qty}</span>
-            <button type="button" data-action="inc" aria-label="Increase quantity">+</button>
-          </div>
-          <button type="button" class="del" data-action="del" aria-label="Delete ${esc(i.name)}">
-            <ha-icon icon="mdi:close"></ha-icon>
-          </button>
-        </div>`
-          )
-          .join("")
-      : `<div class="empty">${this._loaded ? "Nothing on the list. Add your first item above." : "Loading…"}</div>`;
+    let activeHtml;
+    if (!active.length) {
+      activeHtml = `<div class="empty">${this._loaded ? "Nothing on the list. Add your first item above." : "Loading…"}</div>`;
+    } else if (this._config.group_by_store && this._config.stores.length) {
+      activeHtml = [...this._config.stores, null]
+        .map((st) => {
+          const group = active.filter((i) => (i.store || null) === st);
+          if (!group.length) return "";
+          return `<div class="group">${esc(st ?? "No store")}</div>` + group.map((i) => this._activeRow(i)).join("");
+        })
+        .join("");
+    } else {
+      activeHtml = active.map((i) => this._activeRow(i)).join("");
+    }
+    root.getElementById("active").innerHTML = activeHtml;
 
     root.getElementById("completed").innerHTML = completed
       .map(
@@ -433,6 +537,7 @@ class SimpleShoppingCard extends HTMLElement {
         <div class="row done" data-uid="${esc(i.uid)}">
           <input type="checkbox" data-action="toggle" checked aria-label="Mark ${esc(i.name)} as not done" />
           <span class="name">${esc(i.name)}</span>
+          ${i.store ? `<span class="tag">${esc(i.store)}</span>` : ""}
           ${i.qty > 1 ? `<span class="badge">× ${i.qty}</span>` : ""}
         </div>`
       )
@@ -448,7 +553,7 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "simple-shopping-card",
   name: "Simple Shopping Card",
-  description: "Shopping-list style todo card with item quantities and a completed-items time filter.",
+  description: "Shopping-list style todo card with item quantities, store tags and a completed-items time filter.",
 });
 
 console.info(`%c SIMPLE-SHOPPING-CARD %c v${CARD_VERSION} `, "background:#03a9f4;color:#fff", "background:#333;color:#fff");
